@@ -3,8 +3,6 @@
 ## Status update
 
  - Completed merge to 6.2
-   - Awaiting review
-   - Need to fix performance regression
  - Tracing infrastructure is there but will be updated
    - Need to write documentation for others to use (CHERI wiki?)
 
@@ -42,54 +40,78 @@ cbuild qemu
 Note that `cheribuild` can be customised using a config file in ~/.config/cheribuild.json
 for more advanced setups.
 
-## Intro to QEMU codebase
+## Tour of CHERI QEMU
+In the most reductive sense, QEMU is built around a loop of code translation and execution.
+When new guest code needs to be executed, QEMU first translates it to host machine code via the TCG (Tiny Code Generator) subsystem,
+and subsequently transfers control to the translated host machine code.
+This is repeated for every TB (Translation Block), roughly corresponding to a BB (Basic Block) in the guest code.
+The translation and execution loop is periodically interrupted to service I/O and interrupts.
 
- 1. Source code organisation overview (not sure how familiar are people)
-    - Discuss general QEMU architecture
-      - TCG infrastructure
-      	- TCG basics and execution loop
-	- Translation blocks
-	- Interrupt and io escapes
-      - Life of an instruction
-      	- the translation loop
-      	- per-target translation, translation helpers
-	    - TB linking
-    - Memory hierarhcy
-      - machine ram => MMU translation layer and cputlb => memory accessors
- 2. Where does CHERI go in all of this?
-    - Capability format and compression (target/cheri-common/cheri-compressed-cap)
-      - Mention it is shared with other projects.
-      - Very useful [tool](https://www.morello-project.org/capinfo) if you find yourself with a bunch of bits to decode.
-        Sadly it is Morello-only.
-    - Common CHERI helpers (target/cheri-common)
-    - Tag memory
-    - Extensions to targets
-      - target/riscv
-      - target/arm
-        - Relevant files
-          - cheri.decode -- contains bit patterns for instruction decoding.
-            These files are parsed by the `scripts/decodetree.py` tool and documented in `docs/devel/decodetree.rst`
-          - translate-cheri.c.inc -- contains actual CHERI instruction TCG translations.
-            Transforms a single instruction into TCG ops that will run on the host.
-          - cpu.h -- General CPU state description and utility functions.
-          - helper.c -- General CPU helpers (e.g. `arm_cpu_do_interrupt()`)
+### Running CheriBSD on QEMU
+When QEMU is built with `cheribuild`, the binaries will be placed in `<sdkroot>/cherisdk/sdk/bin/qemu-system-<platform>`.
+As a shortcut, `cheribuild` can run CheriBSD as follows:
+
+```
+# Build CheriBSD
+cheribuild cheribsd-morello-purecap
+cheribuild disk-image-morello-purecap
+
+# Run CheriBSD in QEMU
+cheribuild run-morello-purecap
+```
+
+### CHERI QEMU components
+The CHERI-enabled QEMU implements CHERI support with a common CHERI target library and per-target implementations.
+The common CHERI target support "library" is found at `target/cheri-common`; this includes
+
+ - Generic instructon implementations (e.g. setbounds).
+ - Tag memory.
+ - Capability encoding library and helpers to manipulate capability fields from target-specific code.
+ - TCG helpers for common operations(e.g. get capability tag).
+
+Each CHERI-enabled target, implements its own decoding logic for instructions and generally contains:
+
+ 1. CHERI-specific instructions (e.g. setbounds).
+ 2. Legacy ISA instructions with a modified behaviour (e.g. load and stores of integer registers).
+ 3. Unchanged Legacy ISA instructions.
+
+The decoder must also be aware of the program counter capability (PCC) and ensure that bounds checks occur.
+
+Once an instruction is decoded, TCG translation occurs. The target will implement CHERI instructions with a mix of
+TCG instructions and TCG helpers (C functions that are called during the execution phase to implement some instruction logic).
+This code generation is generally split between the *cheri-common* target and the target-specific helpers logic.
+Various other instructions are modified to mediate load and stores with capabilities and manage tags in the register file.
+
+When a TB is fully translated, it can be executed. This mechansim is unchanged from the normal QEMU execution flow.
 
 
 ## Life of an Instruction
 
-As an approachable way to introduce to QEMU, I want to show the CHERI implementation focusing on a single (simple) instruction.
+As an approachable way to introduce to QEMU, I want to show the CHERI implementation focusing on a single (simple)
+ARM Morello instruction.
+Relevant files in the target implementation:
 
-We are at point in which QEMU finds a new instruction stream that needs to be translated.
-We are in the TCG translation loop, at the beginning of a TB.
-The translation loop will repeatedly invoke the target-specific translation hooks to decode instructions end emit TCG.
+ - cpu.h -- General CPU state description and utility functions.
+ - cheri.decode -- contains bit patterns for instruction decoding.
+   These files are parsed by the `scripts/decodetree.py` tool and documented in `docs/devel/decodetree.rst`
+ - translate-a64.c -- top-level aarch64 instruction translation phase, contains the main translation logic.
+ - translate-cheri.c.inc -- contains actual CHERI instruction TCG translations.
+   Transforms a single instruction into TCG ops that will run on the host. This file is included into the top-level translation source.
+ - helper.c -- General CPU helpers (e.g. `arm_cpu_do_interrupt()`)
 
-Condisder a `scbnds` instruction:
+For this example, we assume that we are in the translation loop, at point in which QEMU finds a new instruction stream
+that needs to be translated.
+The translation loop will invoke the target-specific translation logic for each guest instruction to be translated via the TCG.
+
+For the sake of simplicity we focus on the ARM Morello instruction to set capability bounds: `scbnds`.
+
+Condisder the following instruction:
 ```
 # From llvm-objdump -d path/to/kernel.full
 ffff0000000020a4: ef 01 ce c2   scbnds  c15, c15, x14
 ```
 
-Note that the disas above corresponds to:
+Note that the opcode above corresponds to:
 ```
 31                  15                0
 c    2    c    e    0    1    e    f
